@@ -50,18 +50,22 @@ from inimodel2d_from_classes import (
 # --------------------------------------------------------------------------- #
 # Image helpers
 # --------------------------------------------------------------------------- #
-def normalise_u8(arr: np.ndarray) -> np.ndarray:
-    """Robustly scale a float image to contiguous uint8 for display."""
+def normalise_u8(arr: np.ndarray, brightness: float = 0.0,
+                 contrast: float = 1.0) -> np.ndarray:
+    """Robustly scale a float image to uint8, then apply contrast/brightness."""
     a = np.asarray(arr, dtype=np.float32)
     lo, hi = np.percentile(a, 2.0), np.percentile(a, 98.0)
     if hi <= lo:
         hi = lo + 1.0
-    a = np.clip((a - lo) / (hi - lo), 0.0, 1.0)
+    a = (a - lo) / (hi - lo)
+    a = (a - 0.5) * contrast + 0.5 + brightness
+    a = np.clip(a, 0.0, 1.0)
     return np.ascontiguousarray((a * 255.0).astype(np.uint8))
 
 
-def array_to_pixmap(arr: np.ndarray) -> QtGui.QPixmap:
-    u8 = normalise_u8(arr)
+def array_to_pixmap(arr: np.ndarray, brightness: float = 0.0,
+                    contrast: float = 1.0) -> QtGui.QPixmap:
+    u8 = normalise_u8(arr, brightness, contrast)
     h, w = u8.shape
     qimg = QtGui.QImage(u8.data, w, h, w, QtGui.QImage.Format_Grayscale8)
     return QtGui.QPixmap.fromImage(qimg.copy())
@@ -221,6 +225,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.delta_move = 1.0
         self.delta_rot = 2.0
         self.opacity = 0.6
+        self.brightness = 0.0
+        self.contrast = 1.0
+
+        # cached arrays for re-rendering displays on brightness/contrast change
+        self._last_aref = None
+        self._last_central = None
 
         # state
         self.placements: dict[int, Placement] = {}
@@ -243,6 +253,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # class images downscaled to the model sampling (done once)
         self.images_ds = [rec.fourier_resize(img, self.down_size)
                           for img in self.images_full]
+
+    def _pm(self, arr):
+        """Render an array to a pixmap using the current brightness/contrast."""
+        return array_to_pixmap(arr, self.brightness, self.contrast)
+
+    def _update_status(self):
+        self.statusBar().showMessage(
+            f"xrect={self.xrect}  yrect={self.yrect}  "
+            f"down_angpix={self.down_angpix:.3f}  crossover={self.crossover:g} A")
 
     # ------------------------------------------------------------------ #
     # UI construction
@@ -274,9 +293,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gallery.setFixedHeight(150)
         root.addWidget(self.gallery)
 
-        self.statusBar().showMessage(
-            f"xrect={self.xrect}  yrect={self.yrect}  "
-            f"down_angpix={self.down_angpix:.3f}  crossover={self.crossover:g} A")
+        self._update_status()
 
     def _make_image_panel(self, title):
         box = QtWidgets.QGroupBox(title)
@@ -290,6 +307,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_controls(self):
         row = QtWidgets.QHBoxLayout()
+
+        self.crossover_spin = QtWidgets.QDoubleSpinBox()
+        self.crossover_spin.setRange(50.0, 5000.0)
+        self.crossover_spin.setDecimals(1)
+        self.crossover_spin.setSingleStep(10.0)
+        self.crossover_spin.setValue(self.crossover)
+        self.crossover_spin.setPrefix("crossover ")
+        self.crossover_spin.setSuffix(" A")
+        self.crossover_spin.valueChanged.connect(self.on_crossover_changed)
+        row.addWidget(self.crossover_spin)
 
         self.move_spin = QtWidgets.QDoubleSpinBox()
         self.move_spin.setRange(0.1, 50.0)
@@ -316,6 +343,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.alpha_slider.setFixedWidth(120)
         self.alpha_slider.valueChanged.connect(self._on_alpha)
         row.addWidget(self.alpha_slider)
+
+        row.addWidget(QtWidgets.QLabel("Brightness"))
+        self.bright_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.bright_slider.setRange(-100, 100)
+        self.bright_slider.setValue(int(self.brightness * 100))
+        self.bright_slider.setFixedWidth(110)
+        self.bright_slider.valueChanged.connect(self.on_brightness)
+        row.addWidget(self.bright_slider)
+
+        row.addWidget(QtWidgets.QLabel("Contrast"))
+        self.contrast_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.contrast_slider.setRange(10, 300)
+        self.contrast_slider.setValue(int(self.contrast * 100))
+        self.contrast_slider.setFixedWidth(110)
+        self.contrast_slider.valueChanged.connect(self.on_contrast)
+        row.addWidget(self.contrast_slider)
 
         self.flip_btn = QtWidgets.QPushButton("Flip 180")
         self.flip_btn.clicked.connect(self.flip_selected)
@@ -345,7 +388,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_gallery_icon(idx)
 
     def _refresh_gallery_icon(self, idx):
-        pm = array_to_pixmap(self.images_ds[idx]).scaled(
+        pm = self._pm(self.images_ds[idx]).scaled(
             96, 96, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
         canvas = QtGui.QPixmap(96, 96)
         canvas.fill(QtGui.QColor("#000"))
@@ -408,10 +451,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _rebuild_item_pixmaps(self, idx):
         img = self._rendered_image(idx)
-        self.items[idx].setPixmap(array_to_pixmap(img))
+        self.items[idx].setPixmap(self._pm(img))
         self.items[idx].center_offset()
         mate_img = np.flipud(img)
-        self.mates[idx].setPixmap(array_to_pixmap(mate_img))
+        self.mates[idx].setPixmap(self._pm(mate_img))
         pm = self.mates[idx].pixmap()
         self.mates[idx].setOffset(-pm.width() / 2.0, -pm.height() / 2.0)
         self._update_positions(idx)
@@ -424,10 +467,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def add_class(self, idx):
         self.placements[idx] = Placement(idx, 0.0, 0.0, 0.0)
+        self._create_graphics(idx)
+        self.select_class(idx)
+        self._refresh_gallery_icon(idx)
 
+    def _create_graphics(self, idx):
         item = ClassItem(self, idx)
         item.setOpacity(self.opacity)
         item.setZValue(10)
+        item.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable,
+                     idx == self.selected_idx)
         self.scene.addItem(item)
         self.items[idx] = item
 
@@ -439,8 +488,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mates[idx] = mate
 
         self._rebuild_item_pixmaps(idx)
-        self.select_class(idx)
-        self._refresh_gallery_icon(idx)
 
     def remove_class(self, idx):
         if idx in self.items:
@@ -501,6 +548,46 @@ class MainWindow(QtWidgets.QMainWindow):
             item.setOpacity(self.opacity)
             self.mates[idx].setOpacity(self.opacity * 0.7)
 
+    def on_crossover_changed(self, value):
+        value = float(value)
+        if abs(value - self.crossover) < 1e-9:
+            return
+        old_xrect, old_yrect = self.xrect, self.yrect
+        self.crossover = value
+        self._compute_geometry()
+        # keep placements at the same relative position in the resized canvas
+        sx = self.xrect / old_xrect
+        sy = self.yrect / old_yrect
+        for p in self.placements.values():
+            p.cx = self._wrap_x(p.cx * sx)
+            p.cy = p.cy * sy
+        self._reset_scene()
+        for idx in sorted(self.placements):
+            self._create_graphics(idx)
+        self._last_aref = None
+        self._last_central = None
+        self.summed_label[1].clear()
+        self.cross_label[1].clear()
+        self._update_status()
+
+    def on_brightness(self, value):
+        self.brightness = value / 100.0
+        self._rerender_displays()
+
+    def on_contrast(self, value):
+        self.contrast = value / 100.0
+        self._rerender_displays()
+
+    def _rerender_displays(self):
+        for idx in self.gallery_items:
+            self._refresh_gallery_icon(idx)
+        for idx in list(self.items):
+            self._rebuild_item_pixmaps(idx)
+        if self._last_aref is not None:
+            self._show_array(self.summed_label[1], self._last_aref)
+        if self._last_central is not None:
+            self._show_array(self.cross_label[1], self._last_central)
+
     # ------------------------------------------------------------------ #
     # Compute
     # ------------------------------------------------------------------ #
@@ -533,13 +620,14 @@ class MainWindow(QtWidgets.QMainWindow):
                                 reshape=False, order=1, mode="constant", cval=0.0)
             self._show_array(self.cross_label[1], central)
             self._last_aref = aref
+            self._last_central = central
             self.statusBar().showMessage(
                 f"Computed from {len(self.placements)} classes.")
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
 
     def _show_array(self, label, arr):
-        pm = array_to_pixmap(arr).scaled(
+        pm = self._pm(arr).scaled(
             label.width(), label.height(),
             QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
         label.setPixmap(pm)
