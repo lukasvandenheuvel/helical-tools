@@ -105,6 +105,34 @@ def reconstruct2d(sinogram: np.ndarray) -> np.ndarray:
     return rec
 
 
+def project2d(image: np.ndarray, n_ang: int) -> np.ndarray:
+    """Forward-project a 2D cross-section into a (yrect, n_ang) sinogram.
+
+    Adjoint of :func:`reconstruct2d`'s back-projection, i.e. the reprojection
+    step RELION applies to the 2D reconstruction to refresh its rectangle.
+    """
+    n = image.shape[0]
+    center = n // 2
+    coords = np.arange(n) - center
+    grid_x, grid_y = np.meshgrid(coords, coords)
+    grid_y = -grid_y
+    img = image.astype(np.float64)
+
+    sino = np.zeros((n, n_ang), dtype=np.float32)
+    for j in range(n_ang):
+        th = np.deg2rad(j * 360.0 / n_ang)
+        t = grid_x * np.cos(th) + grid_y * np.sin(th) + center
+        i0 = np.floor(t).astype(np.intp)
+        frac = t - i0
+        in_range = (t >= 0.0) & (t <= n - 1)
+        i0c = np.clip(i0, 0, n - 2)
+        col = np.zeros(n, dtype=np.float64)
+        np.add.at(col, i0c[in_range], (img * (1.0 - frac))[in_range])
+        np.add.at(col, (i0c + 1)[in_range], (img * frac)[in_range])
+        sino[:, j] = col
+    return sino
+
+
 def fourier_resize(img: np.ndarray, new_size: int) -> np.ndarray:
     """Resize a square image by cropping/padding its (centered) Fourier transform."""
     old = img.shape[0]

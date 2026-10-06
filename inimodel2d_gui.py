@@ -464,11 +464,15 @@ class Gallery(QtWidgets.QListWidget):
 # Main window / controller
 # --------------------------------------------------------------------------- #
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, images, angpix, ori_size, crossover, maxres, mask_diameter):
+    def __init__(self, images, angpix, ori_size, crossover, maxres, mask_diameter,
+                 class_refs=None, state_path=None):
         super().__init__()
         self.setWindowTitle("2D IniModel Builder")
 
         self.images_full = images
+        self.class_refs = (
+            list(class_refs) if class_refs is not None
+            else [f"{i + 1:08d}@unknown.mrcs" for i in range(len(images))])
         self.angpix = angpix
         self.ori_size = ori_size
         self.crossover = crossover
@@ -507,6 +511,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._populate_gallery()
         self._reset_scene()
+        if state_path is not None:
+            self.load_state(Path(state_path))
 
     # ------------------------------------------------------------------ #
     # Geometry
@@ -1141,29 +1147,154 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("No classes placed.")
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save 3D reconstruction", "test_3d.mrc", "MRC (*.mrc)")
+            self, "Save 3D reconstruction", "inimodel.mrc", "MRC (*.mrc)")
         if not path:
             return
         out3d = Path(path)
-        summed = out3d.with_name(out3d.stem + "_summed.mrc")
+        stem = str(out3d.with_suffix(""))
+        summed = Path(stem + "_summed.mrc")
+        reproj_path = Path(stem + "_reprojections.mrc")
+        state_path = Path(stem + ".star")
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
             rec.write_mrc(summed, aref, self.down_angpix)
+
             cross = rec.reconstruct2d(aref)
             if self.mask_diameter and self.mask_diameter > 0:
                 cross = rec.apply_circular_mask(
                     cross, self.mask_diameter / (2.0 * self.down_angpix))
-            cross = rec.fourier_resize(cross, self.ori_size)
-            vol = rec.reconstruct3d(cross, self.angpix, self.crossover)
+            # reprojections: forward-project the 2D reconstruction (as RELION does)
+            reproj = rec.project2d(cross, self.xrect)
+            rec.write_mrc(reproj_path, reproj, self.down_angpix)
+
+            cross_big = rec.fourier_resize(cross, self.ori_size)
+            vol = rec.reconstruct3d(cross_big, self.angpix, self.crossover)
             rec.write_mrc(out3d, vol, self.angpix)
+
+            self._write_state_star(state_path)
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
-        self.statusBar().showMessage(f"Wrote {summed} and {out3d}")
+        self.statusBar().showMessage(
+            f"Wrote {out3d.name}, {summed.name}, {reproj_path.name}, "
+            f"{state_path.name}")
+
+    def _write_state_star(self, path):
+        lines = [
+            "# 2D IniModel builder saved state",
+            "",
+            "data_inimodel2d",
+            "",
+            f"_inimodelCrossoverDistance   {self.crossover:.6f}",
+            f"_inimodelPixelSize           {self.angpix:.6f}",
+            f"_inimodelMaxResolution       {self.maxres:.6f}",
+            f"_inimodelMaskDiameter        {self.mask_diameter:.6f}",
+            "",
+            "data_classes",
+            "",
+            "loop_",
+            "_rlnReferenceImage #1",
+            "_rlnAnglePsi #2",
+            "_rlnOriginYAngst #3",
+            "_inimodelXFraction #4",
+        ]
+        crossover_pix = self.xrect / 2.0
+        for idx in sorted(self.placements):
+            p = self.placements[idx]
+            yangst = p.cy * self.down_angpix
+            xfrac = p.cx / crossover_pix
+            lines.append(
+                f"{self.class_refs[idx]}   {p.angle:.6f}   "
+                f"{yangst:.6f}   {xfrac:.6f}")
+        Path(path).write_text("\n".join(lines) + "\n")
+
+    def load_state(self, path):
+        params, rows = parse_state_star(Path(path))
+        new_crossover = params.get("crossover")
+        if new_crossover is not None and abs(new_crossover - self.crossover) > 1e-9:
+            self.crossover_spin.blockSignals(True)
+            self.crossover_spin.setValue(new_crossover)
+            self.crossover_spin.blockSignals(False)
+            self.crossover = new_crossover
+            self._compute_geometry()
+            self._reset_scene()
+            self._update_status()
+
+        stack_to_idx = {}
+        for i, ref in enumerate(self.class_refs):
+            try:
+                stack_to_idx[int(ref.split("@", 1)[0])] = i
+            except ValueError:
+                pass
+
+        crossover_pix = self.xrect / 2.0
+        placed = 0
+        for row in rows:
+            try:
+                idx = stack_to_idx.get(int(row["ref"].split("@", 1)[0]))
+            except ValueError:
+                idx = None
+            if idx is None or idx in self.placements:
+                continue
+            cx = row["xfrac"] * crossover_pix
+            cy = row["yangst"] / self.down_angpix
+            self.placements[idx] = Placement(idx, cx, cy, row["psi"])
+            self._create_graphics(idx)
+            self._refresh_gallery_icon(idx)
+            placed += 1
+        self.statusBar().showMessage(f"Loaded state: {placed} classes placed.")
 
 
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+def parse_state_star(path):
+    """Parse a saved-state star: returns (params dict, list of class rows)."""
+    key_map = {
+        "_inimodelCrossoverDistance": "crossover",
+        "_inimodelPixelSize": "angpix",
+        "_inimodelMaxResolution": "maxres",
+        "_inimodelMaskDiameter": "mask",
+    }
+    params = {}
+    columns = []
+    rows = []
+    in_loop = False
+    for raw in Path(path).read_text().splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s == "loop_":
+            in_loop = True
+            columns = []
+            continue
+        if s.startswith("data_"):
+            in_loop = False
+            continue
+        head = s.split()[0]
+        if head in key_map:
+            params[key_map[head]] = float(s.split()[1])
+            continue
+        if in_loop and s.startswith("_"):
+            columns.append(head)
+            continue
+        if in_loop:
+            toks = s.split()
+            if len(toks) >= len(columns):
+                rows.append(dict(zip(columns, toks)))
+
+    parsed = []
+    for r in rows:
+        if "_rlnReferenceImage" not in r:
+            continue
+        parsed.append({
+            "ref": r["_rlnReferenceImage"],
+            "psi": float(r.get("_rlnAnglePsi", 0.0)),
+            "yangst": float(r.get("_rlnOriginYAngst", 0.0)),
+            "xfrac": float(r.get("_inimodelXFraction", 0.0)),
+        })
+    return params, parsed
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1179,17 +1310,20 @@ def parse_args(argv=None):
                         help="Resolution limit (A) used for downscaling")
     parser.add_argument("--mask-diameter", type=float, default=570.0,
                         help="Circular mask diameter (A); <=0 to disable")
+    parser.add_argument("--state", type=Path, default=None,
+                        help="Optional saved-state star file to restore the workspace")
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
-    images, angpix, ori_size = read_selected_classes(
+    images, angpix, ori_size, refs = read_selected_classes(
         args.class_star, args.class_mrcs, args.project_dir)
 
     app = QtWidgets.QApplication(sys.argv[:1])
     win = MainWindow(images, angpix, ori_size, args.crossover,
-                     args.maxres, args.mask_diameter)
+                     args.maxres, args.mask_diameter,
+                     class_refs=refs, state_path=args.state)
     win.resize(1200, 820)
     win.show()
     return app.exec_()

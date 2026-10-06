@@ -67,14 +67,14 @@ def compute_sizing(angpix: float, ori_size: int, crossover: float,
 
 def read_selected_classes(star_path: Path, mrcs_path: Path | None,
                           project_dir: Path | None):
-    """Return (list of 2D class arrays, angpix, ori_size) for the selected classes."""
+    """Return (images, angpix, ori_size, ref_strings) for the selected classes."""
     refs = []
     with open(star_path) as handle:
         for line in handle:
             tok = line.strip().split()
             if tok and "@" in tok[0] and ".mrcs" in tok[0]:
                 idx, rel = tok[0].split("@", 1)
-                refs.append((int(idx), rel))
+                refs.append((int(idx), rel, tok[0]))
     if not refs:
         raise ValueError(f"No _rlnReferenceImage entries found in {star_path}")
 
@@ -87,8 +87,9 @@ def read_selected_classes(star_path: Path, mrcs_path: Path | None,
         angpix = float(mrc.voxel_size.x)
         ori_size = int(mrc.header.nx)
 
-    images = [data[idx - 1] for idx, _ in refs]
-    return images, angpix, ori_size
+    images = [data[idx - 1] for idx, _, _ in refs]
+    ref_strings = [raw for _, _, raw in refs]
+    return images, angpix, ori_size, ref_strings
 
 
 def get_coordinates(n: int, xrect: int, seed: int | None = None):
@@ -163,7 +164,7 @@ def main() -> None:
     parser.add_argument("--out-3d", type=Path, default=Path("test_3d.mrc"))
     args = parser.parse_args()
 
-    images, angpix, ori_size = read_selected_classes(
+    images, angpix, ori_size, _ = read_selected_classes(
         args.class_star, args.class_mrcs, args.project_dir)
 
     down_size, down_angpix, yrect, xrect = compute_sizing(
