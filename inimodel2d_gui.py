@@ -79,6 +79,121 @@ def transform_image(img: np.ndarray, angle_deg: float) -> np.ndarray:
                      mode="constant", cval=0.0)
 
 
+def _place_centered(img: np.ndarray, yrect: int, xrect: int,
+                    mask_radius: float | None = None):
+    """Drop a class image into a (yrect, xrect) canvas, centred, with a Y-band mask.
+
+    Returns the padded image and its (binary) support mask.
+    """
+    ny, nx = img.shape
+    out = np.zeros((yrect, xrect), dtype=np.float64)
+    mask = np.zeros((yrect, xrect), dtype=np.float64)
+    r0 = (yrect - ny) // 2
+    c0 = (xrect - nx) // 2
+    out[r0:r0 + ny, c0:c0 + nx] = img
+    mask[r0:r0 + ny, c0:c0 + nx] = 1.0
+    if mask_radius is not None:
+        cyc = yrect // 2
+        outside = np.abs(np.arange(yrect) - cyc) > mask_radius
+        out[outside, :] = 0.0
+        mask[outside, :] = 0.0
+    return out, mask
+
+
+def wiggle_optimise(reference, base_image, cur_angle, cur_cx, cur_cy, params,
+                    yrect, xrect, down_angpix, mask_diameter):
+    """Cross-correlation refinement of one class against the reference rectangle.
+
+    Reproduces the normalised cross-correlation of relion_helix_inimodel2d
+    (primary + half-crossover Y-flipped mate placement), searched over flipped /
+    rotated versions of the class and all i_offset/j_offset. Minimises:
+
+        Cost = (1 - NCC)
+               + k1 * dist(new, current) / crossover
+               + k2 * |rot(new) - rot(current)| / max_rot
+
+    The two regularisation terms (not present in RELION) anchor the result to the
+    user's manual placement.
+    """
+    max_rot = float(params["max_rot"])
+    delta_rot = float(params["delta_rot"])
+    max_y = float(params["max_y"])
+    delta_y = float(params["delta_y"])
+    k1 = float(params["k1"])
+    k2 = float(params["k2"])
+
+    cyc, cxc = yrect // 2, xrect // 2
+    crossover_pix = xrect / 2.0
+    mask_radius = (mask_diameter / (2.0 * down_angpix)
+                   if (mask_diameter and mask_diameter > 0) else yrect / 2.0 - 2)
+
+    R = np.asarray(reference, dtype=np.float64)
+    # dihedral-transformed reference: mate at (-row, col + xrect/2)
+    Rt = np.roll(np.roll(np.flipud(R), 1, axis=0), -cxc, axis=1)
+    FR = np.fft.fft2(R)
+    FRt = np.fft.fft2(Rt)
+    FM_src = _place_centered(np.ones_like(base_image), yrect, xrect, mask_radius)[1]
+    FM = np.fft.fft2(FM_src)
+    # denominator sum-of-squares of the reference under the class support
+    a2 = (np.fft.ifft2(np.fft.fft2(R * R) * np.conj(FM)).real
+          + np.fft.ifft2(np.fft.fft2(Rt * Rt) * np.conj(FM)).real)
+
+    # rotation candidates (small search + the 180-deg flipped set)
+    if delta_rot > 0:
+        drots = list(np.arange(-max_rot, max_rot + 1e-6, delta_rot))
+    else:
+        drots = [0.0]
+    candidates = [(d, flip) for flip in (False, True) for d in drots]
+
+    # allowed Y positions (centred) and their wrapped row indices
+    if delta_y > 0:
+        dys = np.arange(-max_y, max_y + 1e-6, delta_y)
+    else:
+        dys = np.array([0.0])
+    cy_news = np.array([int(round(cur_cy + d)) for d in dys])
+    di_rows = cy_news % yrect
+
+    cols = np.arange(xrect)
+    cx_centered = np.where(cols < cxc, cols, cols - xrect).astype(np.float64)
+    dx = cx_centered[None, :] - cur_cx
+    dy = cy_news[:, None].astype(np.float64) - cur_cy
+    dist = np.sqrt(dx * dx + dy * dy) / crossover_pix
+
+    best = None
+    for drot, flip in candidates:
+        total_rot = drot + (180.0 if flip else 0.0)
+        timg = transform_image(base_image, cur_angle + total_rot)
+        tpad = _place_centered(timg, yrect, xrect, mask_radius)[0]
+        ft = np.fft.fft2(tpad)
+        num = (np.fft.ifft2(FR * np.conj(ft)).real
+               + np.fft.ifft2(FRt * np.conj(ft)).real)
+        x2 = 2.0 * float(np.sum(tpad * tpad))
+        denom = np.sqrt(np.maximum(a2, 0.0) * x2)
+        ncc = np.where(denom > 1e-12, num / denom, 0.0)
+
+        sub = ncc[di_rows, :]
+        rotpen = (abs(total_rot) / max_rot) if max_rot > 0 else 0.0
+        cost = (1.0 - sub) + k1 * dist + k2 * rotpen
+        r_min, c_min = np.unravel_index(int(np.argmin(cost)), cost.shape)
+        value = float(cost[r_min, c_min])
+        if best is None or value < best["cost"]:
+            best = {
+                "cost": value,
+                "cx": float(cx_centered[c_min]),
+                "cy": float(cy_news[r_min]),
+                "angle": cur_angle + total_rot,
+                "ncc": float(sub[r_min, c_min]),
+                "drot": drot,
+                "flip": flip,
+            }
+
+    best["msg"] = (
+        f"Wiggle: NCC={best['ncc']:.3f}  "
+        f"d(x,y)=({best['cx'] - cur_cx:+.1f},{best['cy'] - cur_cy:+.1f}) px  "
+        f"drot={best['drot']:+.1f} deg{' +flip' if best['flip'] else ''}")
+    return best
+
+
 # --------------------------------------------------------------------------- #
 # Placed-class model
 # --------------------------------------------------------------------------- #
@@ -300,6 +415,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cross_brightness = 0.0
         self.cross_contrast = 1.0
         self.gallery_icon_size = 96
+        self.wiggle = {
+            "max_rot": 5.0, "delta_rot": 1.0,
+            "max_y": 5.0, "delta_y": 1.0,
+            "k1": 0.5, "k2": 0.5,
+        }
 
         # cached arrays for re-rendering displays on brightness/contrast change
         self._last_aref = None
@@ -481,6 +601,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.flip_btn.clicked.connect(self.flip_selected)
         row.addWidget(self.flip_btn)
 
+        self.wiggle_btn = QtWidgets.QPushButton("Wiggle")
+        self.wiggle_btn.clicked.connect(self.wiggle_selected)
+        row.addWidget(self.wiggle_btn)
+
+        self.wiggle_settings_btn = QtWidgets.QPushButton("Wiggle settings")
+        self.wiggle_settings_btn.clicked.connect(self.open_wiggle_settings)
+        row.addWidget(self.wiggle_settings_btn)
+
         self.compute_btn = QtWidgets.QPushButton("Compute summed + cross-section")
         self.compute_btn.clicked.connect(self.compute)
         row.addWidget(self.compute_btn)
@@ -661,6 +789,95 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.placements[self.selected_idx].angle += 180.0
         self._rebuild_item_pixmaps(self.selected_idx)
+
+    def wiggle_selected(self):
+        if self.selected_idx is None:
+            self.statusBar().showMessage("No class selected to wiggle.")
+            return
+        idx = self.selected_idx
+        others = [i for i in sorted(self.placements) if i != idx]
+        if not others:
+            self.statusBar().showMessage(
+                "Wiggle needs at least one other placed class as reference.")
+            return
+        ref_imgs = [transform_image(self.images_ds[i], self.placements[i].angle)
+                    for i in others]
+        ref_xs = [self.placements[i].cx for i in others]
+        ref_ys = [self.placements[i].cy for i in others]
+        reference = build_canvas(ref_imgs, ref_xs, ref_ys, self.yrect, self.xrect)
+
+        p = self.placements[idx]
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            result = wiggle_optimise(
+                reference, self.images_ds[idx], p.angle, p.cx, p.cy,
+                self.wiggle, self.yrect, self.xrect, self.down_angpix,
+                self.mask_diameter)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        p.cx, p.cy, p.angle = result["cx"], result["cy"], result["angle"]
+        self._rebuild_item_pixmaps(idx)
+        self._refresh_gallery_icon(idx)
+        self.statusBar().showMessage(result["msg"])
+
+    def open_wiggle_settings(self):
+        w = self.wiggle
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Wiggle settings")
+        form = QtWidgets.QFormLayout(dlg)
+
+        def spin(value, lo, hi, step, suffix):
+            s = QtWidgets.QDoubleSpinBox()
+            s.setRange(lo, hi)
+            s.setDecimals(1)
+            s.setSingleStep(step)
+            s.setValue(value)
+            s.setSuffix(suffix)
+            return s
+
+        max_rot = spin(w["max_rot"], 0.0, 180.0, 1.0, " deg")
+        delta_rot = spin(w["delta_rot"], 0.1, 90.0, 0.5, " deg")
+        max_y = spin(w["max_y"], 0.0, 200.0, 1.0, " px")
+        delta_y = spin(w["delta_y"], 0.1, 50.0, 0.5, " px")
+
+        def rigidity(value):
+            slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            slider.setRange(0, 100)
+            slider.setValue(int(round(value * 100)))
+            slider.setFixedWidth(160)
+            lab = QtWidgets.QLabel(f"{value:.2f}")
+            slider.valueChanged.connect(lambda v: lab.setText(f"{v / 100:.2f}"))
+            holder = QtWidgets.QWidget()
+            box = QtWidgets.QHBoxLayout(holder)
+            box.setContentsMargins(0, 0, 0, 0)
+            box.addWidget(slider)
+            box.addWidget(lab)
+            return slider, holder
+
+        k1_slider, k1_w = rigidity(w["k1"])
+        k2_slider, k2_w = rigidity(w["k2"])
+
+        form.addRow("Max rotation", max_rot)
+        form.addRow("Delta rotation", delta_rot)
+        form.addRow("Max Y displacement", max_y)
+        form.addRow("Delta Y displacement", delta_y)
+        form.addRow("Translation rigidity (k1)", k1_w)
+        form.addRow("Rotation rigidity (k2)", k2_w)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            w["max_rot"] = max_rot.value()
+            w["delta_rot"] = delta_rot.value()
+            w["max_y"] = max_y.value()
+            w["delta_y"] = delta_y.value()
+            w["k1"] = k1_slider.value() / 100.0
+            w["k2"] = k2_slider.value() / 100.0
+            self.statusBar().showMessage("Wiggle settings updated.")
 
     def _on_alpha(self, value):
         self.opacity = value / 100.0
