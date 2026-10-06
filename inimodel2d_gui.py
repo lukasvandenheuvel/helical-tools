@@ -139,12 +139,30 @@ class WorkspaceView(QtWidgets.QGraphicsView):
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.setDragMode(QtWidgets.QGraphicsView.NoDrag)
         self.setRenderHint(QtGui.QPainter.Antialiasing, False)
-        self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
         self._r_held = False
+        self._user_zoom = False
+
+    def fit(self):
+        self._user_zoom = False
+        if self.scene() is not None:
+            self.fitInView(self.scene().sceneRect(), QtCore.Qt.KeepAspectRatio)
+
+    def wheelEvent(self, event):
+        factor = 1.25 if event.angleDelta().y() > 0 else 0.8
+        self.scale(factor, factor)
+        self._user_zoom = True
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        if not isinstance(self.itemAt(event.pos()), ClassItem):
+            self.fit()
+        super().mouseDoubleClickEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.scene() is not None:
+        if self.scene() is not None and not self._user_zoom:
             self.fitInView(self.scene().sceneRect(), QtCore.Qt.KeepAspectRatio)
 
     def keyPressEvent(self, event):
@@ -180,6 +198,58 @@ class WorkspaceView(QtWidgets.QGraphicsView):
             event.accept()
             return
         super().keyReleaseEvent(event)
+
+
+# --------------------------------------------------------------------------- #
+# Zoomable image panel (summed rectangle / reconstruction cross-section)
+# --------------------------------------------------------------------------- #
+class ZoomableImageView(QtWidgets.QGraphicsView):
+    """Single-image panel with mouse-wheel zoom; double-click resets to fit."""
+
+    def __init__(self):
+        super().__init__()
+        self._scene = QtWidgets.QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._item = QtWidgets.QGraphicsPixmapItem()
+        self._item.setTransformationMode(QtCore.Qt.SmoothTransformation)
+        self._scene.addItem(self._item)
+        self.setBackgroundBrush(QtGui.QColor("#111"))
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
+        self.setMinimumHeight(80)
+        self._has_image = False
+        self._user_zoom = False
+
+    def set_image(self, pixmap):
+        self._item.setPixmap(pixmap)
+        self._scene.setSceneRect(QtCore.QRectF(pixmap.rect()))
+        self._has_image = not pixmap.isNull()
+        if self._has_image and not self._user_zoom:
+            self.fitInView(self._item, QtCore.Qt.KeepAspectRatio)
+
+    def clear(self):
+        self._item.setPixmap(QtGui.QPixmap())
+        self._has_image = False
+        self._user_zoom = False
+
+    def wheelEvent(self, event):
+        if not self._has_image:
+            return
+        factor = 1.25 if event.angleDelta().y() > 0 else 0.8
+        self.scale(factor, factor)
+        self._user_zoom = True
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        self._user_zoom = False
+        if self._has_image:
+            self.fitInView(self._item, QtCore.Qt.KeepAspectRatio)
+        super().mouseDoubleClickEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._has_image and not self._user_zoom:
+            self.fitInView(self._item, QtCore.Qt.KeepAspectRatio)
 
 
 # --------------------------------------------------------------------------- #
@@ -227,6 +297,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.opacity = 0.6
         self.brightness = 0.0
         self.contrast = 1.0
+        self.cross_brightness = 0.0
+        self.cross_contrast = 1.0
+        self.gallery_icon_size = 96
 
         # cached arrays for re-rendering displays on brightness/contrast change
         self._last_aref = None
@@ -258,6 +331,10 @@ class MainWindow(QtWidgets.QMainWindow):
         """Render an array to a pixmap using the current brightness/contrast."""
         return array_to_pixmap(arr, self.brightness, self.contrast)
 
+    def _pm_cross(self, arr):
+        """Render the cross-section with its own brightness/contrast."""
+        return array_to_pixmap(arr, self.cross_brightness, self.cross_contrast)
+
     def _update_status(self):
         self.statusBar().showMessage(
             f"xrect={self.xrect}  yrect={self.yrect}  "
@@ -277,20 +354,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scene = QtWidgets.QGraphicsScene()
         self.view = WorkspaceView(self)
         self.view.setScene(self.scene)
-        self.view.setMinimumHeight(200)
+        self.view.setMinimumHeight(120)
         root.addWidget(self.view, stretch=3)
 
         # summed + cross-section row
         mid = QtWidgets.QHBoxLayout()
-        self.summed_label = self._make_image_panel("Summed rectangle")
-        self.cross_label = self._make_image_panel("Reconstruction cross-section")
-        mid.addWidget(self.summed_label[0], stretch=2)
-        mid.addWidget(self.cross_label[0], stretch=1)
+        summed_box, self.summed_view = self._make_image_panel("Summed rectangle")
+        cross_box, self.cross_view = self._make_cross_panel(
+            "Reconstruction cross-section")
+        mid.addWidget(summed_box, stretch=2)
+        mid.addWidget(cross_box, stretch=1)
         root.addLayout(mid, stretch=2)
 
-        # gallery
+        # gallery size control + gallery
+        gal_row = QtWidgets.QHBoxLayout()
+        gal_row.addWidget(QtWidgets.QLabel("2D class size"))
+        self.gallery_size_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.gallery_size_slider.setRange(64, 320)
+        self.gallery_size_slider.setValue(self.gallery_icon_size)
+        self.gallery_size_slider.setFixedWidth(180)
+        self.gallery_size_slider.valueChanged.connect(self.on_gallery_size)
+        gal_row.addWidget(self.gallery_size_slider)
+        gal_row.addStretch(1)
+        root.addLayout(gal_row)
+
         self.gallery = Gallery(self)
-        self.gallery.setFixedHeight(150)
+        self.gallery.setIconSize(
+            QtCore.QSize(self.gallery_icon_size, self.gallery_icon_size))
+        self.gallery.setFixedHeight(self._gallery_height())
         root.addWidget(self.gallery)
 
         self._update_status()
@@ -298,12 +389,38 @@ class MainWindow(QtWidgets.QMainWindow):
     def _make_image_panel(self, title):
         box = QtWidgets.QGroupBox(title)
         lay = QtWidgets.QVBoxLayout(box)
-        label = QtWidgets.QLabel()
-        label.setAlignment(QtCore.Qt.AlignCenter)
-        label.setMinimumHeight(140)
-        label.setStyleSheet("background:#111;")
-        lay.addWidget(label)
-        return box, label
+        view = ZoomableImageView()
+        lay.addWidget(view)
+        return box, view
+
+    def _make_cross_panel(self, title):
+        box = QtWidgets.QGroupBox(title)
+        lay = QtWidgets.QHBoxLayout(box)
+        view = ZoomableImageView()
+        lay.addWidget(view, stretch=1)
+
+        self.cross_bright_slider = QtWidgets.QSlider(QtCore.Qt.Vertical)
+        self.cross_bright_slider.setRange(-100, 100)
+        self.cross_bright_slider.setValue(0)
+        self.cross_bright_slider.valueChanged.connect(self.on_cross_brightness)
+
+        self.cross_contrast_slider = QtWidgets.QSlider(QtCore.Qt.Vertical)
+        self.cross_contrast_slider.setRange(10, 300)
+        self.cross_contrast_slider.setValue(100)
+        self.cross_contrast_slider.valueChanged.connect(self.on_cross_contrast)
+
+        for caption, slider in (("B", self.cross_bright_slider),
+                                ("C", self.cross_contrast_slider)):
+            col = QtWidgets.QVBoxLayout()
+            lbl = QtWidgets.QLabel(caption)
+            lbl.setAlignment(QtCore.Qt.AlignCenter)
+            col.addWidget(lbl)
+            col.addWidget(slider)
+            lay.addLayout(col)
+        return box, view
+
+    def _gallery_height(self):
+        return self.gallery_icon_size + 56
 
     def _build_controls(self):
         row = QtWidgets.QHBoxLayout()
@@ -388,23 +505,26 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_gallery_icon(idx)
 
     def _refresh_gallery_icon(self, idx):
+        size = self.gallery_icon_size
         pm = self._pm(self.images_ds[idx]).scaled(
-            96, 96, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
-        canvas = QtGui.QPixmap(96, 96)
+            size, size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        canvas = QtGui.QPixmap(size, size)
         canvas.fill(QtGui.QColor("#000"))
         painter = QtGui.QPainter(canvas)
-        x = (96 - pm.width()) // 2
-        y = (96 - pm.height()) // 2
+        x = (size - pm.width()) // 2
+        y = (size - pm.height()) // 2
         painter.drawPixmap(x, y, pm)
         color = None
         if idx == self.selected_idx:
             color = QtGui.QColor(0, 220, 0)
         elif idx in self.placements:
-            color = QtGui.QColor(255, 255, 255)
+            color = QtGui.QColor(255, 255, 0)
         if color is not None:
-            pen = QtGui.QPen(color, 4)
+            bw = max(3, size // 24)
+            pen = QtGui.QPen(color, bw)
             painter.setPen(pen)
-            painter.drawRect(2, 2, 92, 92)
+            off = bw // 2 + 1
+            painter.drawRect(off, off, size - 2 * off, size - 2 * off)
         painter.end()
         self.gallery_items[idx].setIcon(QtGui.QIcon(canvas))
 
@@ -437,7 +557,7 @@ class MainWindow(QtWidgets.QMainWindow):
         guide.setCosmetic(True)
         self.scene.addLine(0, -hh, 0, hh, guide)        # crossover split
         self.scene.addLine(-hw, 0, hw, 0, guide)        # horizontal centre
-        self.view.fitInView(self.scene.sceneRect(), QtCore.Qt.KeepAspectRatio)
+        self.view.fit()
 
     def _wrap_x(self, x):
         hw = self.xrect / 2.0
@@ -566,27 +686,45 @@ class MainWindow(QtWidgets.QMainWindow):
             self._create_graphics(idx)
         self._last_aref = None
         self._last_central = None
-        self.summed_label[1].clear()
-        self.cross_label[1].clear()
+        self.summed_view.clear()
+        self.cross_view.clear()
         self._update_status()
 
     def on_brightness(self, value):
         self.brightness = value / 100.0
-        self._rerender_displays()
+        self._rerender_global()
 
     def on_contrast(self, value):
         self.contrast = value / 100.0
-        self._rerender_displays()
+        self._rerender_global()
 
-    def _rerender_displays(self):
+    def on_cross_brightness(self, value):
+        self.cross_brightness = value / 100.0
+        self._rerender_cross()
+
+    def on_cross_contrast(self, value):
+        self.cross_contrast = value / 100.0
+        self._rerender_cross()
+
+    def on_gallery_size(self, value):
+        self.gallery_icon_size = int(value)
+        self.gallery.setIconSize(
+            QtCore.QSize(self.gallery_icon_size, self.gallery_icon_size))
+        self.gallery.setFixedHeight(self._gallery_height())
+        for idx in self.gallery_items:
+            self._refresh_gallery_icon(idx)
+
+    def _rerender_global(self):
         for idx in self.gallery_items:
             self._refresh_gallery_icon(idx)
         for idx in list(self.items):
             self._rebuild_item_pixmaps(idx)
         if self._last_aref is not None:
-            self._show_array(self.summed_label[1], self._last_aref)
+            self.summed_view.set_image(self._pm(self._last_aref))
+
+    def _rerender_cross(self):
         if self._last_central is not None:
-            self._show_array(self.cross_label[1], self._last_central)
+            self.cross_view.set_image(self._pm_cross(self._last_central))
 
     # ------------------------------------------------------------------ #
     # Compute
@@ -608,7 +746,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            self._show_array(self.summed_label[1], aref)
+            self.summed_view.set_image(self._pm(aref))
 
             cross = rec.reconstruct2d(aref)
             if self.mask_diameter and self.mask_diameter > 0:
@@ -618,19 +756,13 @@ class MainWindow(QtWidgets.QMainWindow):
             deg_per_pixel = 180.0 * self.angpix / self.crossover
             central = nd_rotate(cross, deg_per_pixel * (self.ori_size // 2),
                                 reshape=False, order=1, mode="constant", cval=0.0)
-            self._show_array(self.cross_label[1], central)
+            self.cross_view.set_image(self._pm_cross(central))
             self._last_aref = aref
             self._last_central = central
             self.statusBar().showMessage(
                 f"Computed from {len(self.placements)} classes.")
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
-
-    def _show_array(self, label, arr):
-        pm = self._pm(arr).scaled(
-            label.width(), label.height(),
-            QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
-        label.setPixmap(pm)
 
     def save_outputs(self):
         aref = self._build_summed()
