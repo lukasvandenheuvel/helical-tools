@@ -227,7 +227,14 @@ class ClassItem(QtWidgets.QGraphicsPixmapItem):
     # select on click
     def mousePressEvent(self, event):
         self.controller.select_class(self.class_idx)
+        if event.button() == QtCore.Qt.LeftButton:
+            self.controller.begin_move()
         super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if event.button() == QtCore.Qt.LeftButton:
+            self.controller.end_move()
 
     def itemChange(self, change, value):
         if change == QtWidgets.QGraphicsItem.ItemPositionChange and self.scene():
@@ -245,17 +252,80 @@ class ClassItem(QtWidgets.QGraphicsPixmapItem):
 
 
 # --------------------------------------------------------------------------- #
+# Base canvas view: wheel zoom + pan (spacebar-left-drag or middle-mouse-drag)
+# --------------------------------------------------------------------------- #
+class CanvasView(QtWidgets.QGraphicsView):
+    def __init__(self):
+        super().__init__()
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
+        self._space_held = False
+        self._panning = False
+        self._pan_last = None
+
+    def _pan_by(self, pos):
+        delta = pos - self._pan_last
+        self._pan_last = pos
+        hbar, vbar = self.horizontalScrollBar(), self.verticalScrollBar()
+        hbar.setValue(hbar.value() - delta.x())
+        vbar.setValue(vbar.value() - delta.y())
+
+    def mousePressEvent(self, event):
+        if (event.button() == QtCore.Qt.MiddleButton
+                or (event.button() == QtCore.Qt.LeftButton and self._space_held)):
+            self._panning = True
+            self._pan_last = event.pos()
+            self.viewport().setCursor(QtCore.Qt.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._panning:
+            self._pan_by(event.pos())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._panning:
+            self._panning = False
+            self._pan_last = None
+            self.viewport().setCursor(
+                QtCore.Qt.OpenHandCursor if self._space_held
+                else QtCore.Qt.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key_Space:
+            self._space_held = True
+            self.viewport().setCursor(QtCore.Qt.OpenHandCursor)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == QtCore.Qt.Key_Space:
+            self._space_held = False
+            if not self._panning:
+                self.viewport().setCursor(QtCore.Qt.ArrowCursor)
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+
+# --------------------------------------------------------------------------- #
 # Workspace view (owns key handling for move/rotate)
 # --------------------------------------------------------------------------- #
-class WorkspaceView(QtWidgets.QGraphicsView):
+class WorkspaceView(CanvasView):
     def __init__(self, controller):
         super().__init__()
         self.controller = controller
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.setDragMode(QtWidgets.QGraphicsView.NoDrag)
         self.setRenderHint(QtGui.QPainter.Antialiasing, False)
-        self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
-        self.setResizeAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
         self._r_held = False
         self._user_zoom = False
 
@@ -318,8 +388,8 @@ class WorkspaceView(QtWidgets.QGraphicsView):
 # --------------------------------------------------------------------------- #
 # Zoomable image panel (summed rectangle / reconstruction cross-section)
 # --------------------------------------------------------------------------- #
-class ZoomableImageView(QtWidgets.QGraphicsView):
-    """Single-image panel with mouse-wheel zoom; double-click resets to fit."""
+class ZoomableImageView(CanvasView):
+    """Single-image panel with mouse-wheel zoom + pan; double-click resets to fit."""
 
     def __init__(self):
         super().__init__()
@@ -329,8 +399,7 @@ class ZoomableImageView(QtWidgets.QGraphicsView):
         self._item.setTransformationMode(QtCore.Qt.SmoothTransformation)
         self._scene.addItem(self._item)
         self.setBackgroundBrush(QtGui.QColor("#111"))
-        self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
-        self.setResizeAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.setMinimumHeight(80)
         self._has_image = False
         self._user_zoom = False
@@ -431,6 +500,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mates: dict[int, QtWidgets.QGraphicsPixmapItem] = {}
         self.selected_idx: int | None = None
         self.gallery_items: dict[int, QtWidgets.QListWidgetItem] = {}
+        self._undo_stack = []
+        self._move_snapshot = None
 
         self._compute_geometry()
         self._build_ui()
@@ -503,6 +574,9 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.QSize(self.gallery_icon_size, self.gallery_icon_size))
         self.gallery.setFixedHeight(self._gallery_height())
         root.addWidget(self.gallery)
+
+        undo_sc = QtWidgets.QShortcut(QtGui.QKeySequence.Undo, self)
+        undo_sc.activated.connect(self.undo)
 
         self._update_status()
 
@@ -609,6 +683,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.wiggle_settings_btn.clicked.connect(self.open_wiggle_settings)
         row.addWidget(self.wiggle_settings_btn)
 
+        self.wiggle_all_btn = QtWidgets.QPushButton("Wiggle all")
+        self.wiggle_all_btn.clicked.connect(self.wiggle_all)
+        row.addWidget(self.wiggle_all_btn)
+
         self.compute_btn = QtWidgets.QPushButton("Compute summed + cross-section")
         self.compute_btn.clicked.connect(self.compute)
         row.addWidget(self.compute_btn)
@@ -661,6 +739,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.select_class(idx)
 
     def gallery_double_click(self, idx):
+        self.push_undo()
         if idx in self.placements:
             self.remove_class(idx)
         else:
@@ -762,6 +841,54 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._refresh_gallery_icon(i)
 
     # ------------------------------------------------------------------ #
+    # Undo history
+    # ------------------------------------------------------------------ #
+    def _snapshot(self):
+        placed = {i: (p.cx, p.cy, p.angle) for i, p in self.placements.items()}
+        return placed, self.selected_idx
+
+    def push_undo(self):
+        self._undo_stack.append(self._snapshot())
+        if len(self._undo_stack) > 200:
+            self._undo_stack.pop(0)
+
+    def begin_move(self):
+        self._move_snapshot = self._snapshot()
+
+    def end_move(self):
+        if self._move_snapshot is None:
+            return
+        before = self._move_snapshot[0]
+        now = {i: (p.cx, p.cy, p.angle) for i, p in self.placements.items()}
+        if before != now:
+            self._undo_stack.append(self._move_snapshot)
+        self._move_snapshot = None
+
+    def undo(self):
+        if not self._undo_stack:
+            self.statusBar().showMessage("Nothing to undo.")
+            return
+        self._restore_state(self._undo_stack.pop())
+        self.statusBar().showMessage("Undo.")
+
+    def _restore_state(self, state):
+        placed, sel = state
+        affected = set(self.placements) | set(placed)
+        for i in list(self.items):
+            self.scene.removeItem(self.items[i])
+            self.scene.removeItem(self.mates[i])
+        self.items.clear()
+        self.mates.clear()
+        self.placements = {i: Placement(i, cx, cy, ang)
+                           for i, (cx, cy, ang) in placed.items()}
+        self.selected_idx = sel if sel in self.placements else None
+        for i in sorted(self.placements):
+            self._create_graphics(i)
+        for i in affected:
+            if i in self.gallery_items:
+                self._refresh_gallery_icon(i)
+
+    # ------------------------------------------------------------------ #
     # Movement / rotation callbacks
     # ------------------------------------------------------------------ #
     def on_item_moved(self, idx, pos: QtCore.QPointF):
@@ -773,6 +900,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def nudge_selected(self, dx, dy):
         if self.selected_idx is None:
             return
+        self.push_undo()
         p = self.placements[self.selected_idx]
         p.cx = self._wrap_x(p.cx + dx)
         p.cy = p.cy + dy
@@ -781,44 +909,70 @@ class MainWindow(QtWidgets.QMainWindow):
     def rotate_selected(self, sign):
         if self.selected_idx is None:
             return
+        self.push_undo()
         self.placements[self.selected_idx].angle += sign * self.delta_rot
         self._rebuild_item_pixmaps(self.selected_idx)
 
     def flip_selected(self):
         if self.selected_idx is None:
             return
+        self.push_undo()
         self.placements[self.selected_idx].angle += 180.0
         self._rebuild_item_pixmaps(self.selected_idx)
+
+    def _wiggle_one(self, idx):
+        others = [i for i in sorted(self.placements) if i != idx]
+        if not others:
+            return None
+        ref_imgs = [transform_image(self.images_ds[i], self.placements[i].angle)
+                    for i in others]
+        ref_xs = [self.placements[i].cx for i in others]
+        ref_ys = [self.placements[i].cy for i in others]
+        reference = build_canvas(ref_imgs, ref_xs, ref_ys, self.yrect, self.xrect)
+        p = self.placements[idx]
+        result = wiggle_optimise(
+            reference, self.images_ds[idx], p.angle, p.cx, p.cy,
+            self.wiggle, self.yrect, self.xrect, self.down_angpix,
+            self.mask_diameter)
+        p.cx, p.cy, p.angle = result["cx"], result["cy"], result["angle"]
+        self._rebuild_item_pixmaps(idx)
+        self._refresh_gallery_icon(idx)
+        return result
 
     def wiggle_selected(self):
         if self.selected_idx is None:
             self.statusBar().showMessage("No class selected to wiggle.")
             return
         idx = self.selected_idx
-        others = [i for i in sorted(self.placements) if i != idx]
-        if not others:
+        if not [i for i in self.placements if i != idx]:
             self.statusBar().showMessage(
                 "Wiggle needs at least one other placed class as reference.")
             return
-        ref_imgs = [transform_image(self.images_ds[i], self.placements[i].angle)
-                    for i in others]
-        ref_xs = [self.placements[i].cx for i in others]
-        ref_ys = [self.placements[i].cy for i in others]
-        reference = build_canvas(ref_imgs, ref_xs, ref_ys, self.yrect, self.xrect)
-
-        p = self.placements[idx]
+        self.push_undo()
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            result = wiggle_optimise(
-                reference, self.images_ds[idx], p.angle, p.cx, p.cy,
-                self.wiggle, self.yrect, self.xrect, self.down_angpix,
-                self.mask_diameter)
+            result = self._wiggle_one(idx)
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
-        p.cx, p.cy, p.angle = result["cx"], result["cy"], result["angle"]
-        self._rebuild_item_pixmaps(idx)
-        self._refresh_gallery_icon(idx)
         self.statusBar().showMessage(result["msg"])
+
+    def wiggle_all(self):
+        placed = sorted(self.placements)
+        if len(placed) < 2:
+            self.statusBar().showMessage(
+                "Wiggle all needs at least two placed classes.")
+            return
+        self.push_undo()
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        moved = 0
+        try:
+            for idx in placed:
+                if self._wiggle_one(idx) is not None:
+                    moved += 1
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self.statusBar().showMessage(
+            f"Wiggle all: refined {moved}/{len(placed)} classes.")
 
     def open_wiggle_settings(self):
         w = self.wiggle
