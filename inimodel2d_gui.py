@@ -761,7 +761,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.items.clear()
         self.mates.clear()
         hw, hh = self.xrect / 2.0, self.yrect / 2.0
-        self.scene.setSceneRect(-hw, -hh, self.xrect, self.yrect)
+        lim = self._x_drag_limit()
+        self.scene.setSceneRect(-lim, -hh, 2.0 * lim, self.yrect)
 
         # background rectangle + guide lines
         border = QtGui.QPen(QtGui.QColor(80, 120, 200), 0)
@@ -777,8 +778,16 @@ class MainWindow(QtWidgets.QMainWindow):
         hw = self.xrect / 2.0
         return (x + hw) % self.xrect - hw
 
+    def _x_drag_limit(self):
+        # allow dragging up to 1.5x the crossover distance (xrect/2 = 1 crossover)
+        return 1.5 * self.xrect / 2.0
+
+    def _clamp_x(self, x):
+        lim = self._x_drag_limit()
+        return max(-lim, min(lim, x))
+
     def constrain_position(self, pos: QtCore.QPointF) -> QtCore.QPointF:
-        return QtCore.QPointF(self._wrap_x(pos.x()), pos.y())
+        return QtCore.QPointF(self._clamp_x(pos.x()), pos.y())
 
     def _rendered_image(self, idx):
         return transform_image(self.images_ds[idx], self.placements[idx].angle)
@@ -816,7 +825,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         mate = QtWidgets.QGraphicsPixmapItem()
         mate.setTransformationMode(QtCore.Qt.SmoothTransformation)
-        mate.setOpacity(self.opacity * 0.7)
+        mate.setOpacity(self.opacity)
         mate.setZValue(5)
         self.scene.addItem(mate)
         self.mates[idx] = mate
@@ -912,7 +921,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.push_undo()
         p = self.placements[self.selected_idx]
-        p.cx = self._wrap_x(p.cx + dx)
+        p.cx = self._clamp_x(p.cx + dx)
         p.cy = p.cy + dy
         self._update_positions(self.selected_idx)
 
@@ -1047,7 +1056,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.opacity = value / 100.0
         for idx, item in self.items.items():
             item.setOpacity(self.opacity)
-            self.mates[idx].setOpacity(self.opacity * 0.7)
+            self.mates[idx].setOpacity(self.opacity)
 
     def on_crossover_changed(self, value):
         value = float(value)
@@ -1060,7 +1069,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sx = self.xrect / old_xrect
         sy = self.yrect / old_yrect
         for p in self.placements.values():
-            p.cx = self._wrap_x(p.cx * sx)
+            p.cx = self._clamp_x(p.cx * sx)
             p.cy = p.cy * sy
         self._reset_scene()
         for idx in sorted(self.placements):
