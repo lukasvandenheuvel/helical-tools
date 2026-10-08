@@ -878,6 +878,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._move_snapshot is None:
             return
         before = self._move_snapshot[0]
+        # snap any dragged class back into the periodic rectangle on release
+        for idx, p in self.placements.items():
+            wrapped = self._wrap_x(p.cx)
+            if abs(wrapped - p.cx) > 1e-9:
+                p.cx = wrapped
+                self._update_positions(idx)
         now = {i: (p.cx, p.cy, p.angle) for i, p in self.placements.items()}
         if before != now:
             self._undo_stack.append(self._move_snapshot)
@@ -921,7 +927,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.push_undo()
         p = self.placements[self.selected_idx]
-        p.cx = self._clamp_x(p.cx + dx)
+        p.cx = self._wrap_x(p.cx + dx)
         p.cy = p.cy + dy
         self._update_positions(self.selected_idx)
 
@@ -1069,7 +1075,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sx = self.xrect / old_xrect
         sy = self.yrect / old_yrect
         for p in self.placements.values():
-            p.cx = self._clamp_x(p.cx * sx)
+            p.cx = self._wrap_x(p.cx * sx)
             p.cy = p.cy * sy
         self._reset_scene()
         for idx in sorted(self.placements):
