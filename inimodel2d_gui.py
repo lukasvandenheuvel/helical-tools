@@ -551,6 +551,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scene = QtWidgets.QGraphicsScene()
         self.view = WorkspaceView(self)
         self.view.setScene(self.scene)
+        self.view.setBackgroundBrush(QtGui.QColor("#000"))
         self.view.setMinimumHeight(120)
         root.addWidget(self.view, stretch=3)
 
@@ -842,6 +843,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 movable = i == idx
                 self.items[i].setFlag(
                     QtWidgets.QGraphicsItem.ItemIsMovable, movable)
+                # raise the selected class (and its mate) above the others
+                self.items[i].setZValue(20 if movable else 10)
+                self.mates[i].setZValue(15 if movable else 5)
                 self.items[i].update()
             if i in self.gallery_items:
                 self._refresh_gallery_icon(i)
